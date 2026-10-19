@@ -1,4 +1,57 @@
 
+name: Deploy test website
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate website file
+        run: test -s site/index.html
+
+      - name: Configure SSH
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_SSH_KEY_B64: ${{ secrets.SERVER_SSH_KEY_B64 }}
+        run: |
+          set -eu
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          if [ -z "$SERVER_SSH_KEY_B64" ]; then
+            echo "ERROR: SERVER_SSH_KEY_B64 is missing."
+            exit 1
+          fi
+
+          printf '%s' "$SERVER_SSH_KEY_B64" | base64 --decode > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null
+          echo "Private key format: valid"
+
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Test SSH connection
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          set -eu
+          ssh -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            "$SERVER_USER@$SERVER_HOST" 'whoami'
+
       - name: Upload website
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
@@ -6,16 +59,29 @@
         run: |
           set -eu
 
-          scp \
-            -i ~/.ssh/deploy_key \
+          scp -i ~/.ssh/deploy_key \
             -o IdentitiesOnly=yes \
             -o BatchMode=yes \
             site/index.html \
             "$SERVER_USER@$SERVER_HOST:/tmp/farameet-index.html"
 
-          ssh \
-            -i ~/.ssh/deploy_key \
+          ssh -i ~/.ssh/deploy_key \
             -o IdentitiesOnly=yes \
             -o BatchMode=yes \
             "$SERVER_USER@$SERVER_HOST" \
             'sudo -n /usr/local/sbin/deploy-server-farameet'
+
+      - name: Verify deployed website
+        run: |
+          set -eu
+
+          curl --fail --show-error --silent \
+            --retry 3 \
+            --retry-delay 2 \
+            --retry-connrefused \
+            -H "Host: server.farameet.ir" \
+            http://89.44.240.150/ \
+            -o /tmp/deployed-page.html
+
+          grep -qi '<html' /tmp/deployed-page.html
+          echo "Website deployment verified."
