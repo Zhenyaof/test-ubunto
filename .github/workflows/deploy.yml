@@ -21,13 +21,22 @@ jobs:
 
       - name: Configure SSH
         env:
-          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_SSH_KEY_B64: ${{ secrets.SERVER_SSH_KEY_B64 }}
         run: |
+          set -eu
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
 
-          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          if [ -z "$SERVER_SSH_KEY_B64" ]; then
+            echo "ERROR: SERVER_SSH_KEY_B64 secret is empty or missing."
+            exit 1
+          fi
+
+          printf '%s' "$SERVER_SSH_KEY_B64" \
+            | base64 --decode > ~/.ssh/deploy_key
+
           chmod 600 ~/.ssh/deploy_key
 
           if ! ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null 2>&1; then
@@ -35,28 +44,60 @@ jobs:
             exit 1
           fi
 
-          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+          echo "Private key format: valid"
+
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          chmod 600 ~/.ssh/known_hosts
 
       - name: Test SSH connection
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
         run: |
-          ssh -i ~/.ssh/deploy_key \
+          set -eu
+
+          ssh \
+            -i ~/.ssh/deploy_key \
             -o IdentitiesOnly=yes \
-            "$SERVER_USER@$SERVER_HOST" 'whoami'
+            -o BatchMode=yes \
+            "$SERVER_USER@$SERVER_HOST" \
+            'whoami'
 
       - name: Upload website
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
         run: |
-          scp -i ~/.ssh/deploy_key \
+          set -eu
+
+          scp \
+            -i ~/.ssh/deploy_key \
             -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
             site/index.html \
             "$SERVER_USER@$SERVER_HOST:/tmp/farameet-index.html"
 
-          ssh -i ~/.ssh/deploy_key \
+          ssh \
+            -i ~/.ssh/deploy_key \
             -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
             "$SERVER_USER@$SERVER_HOST" \
             'sudo install -o www-data -g www-data -m 644 /tmp/farameet-index.html /var/www/server.farameet.ir/index.html && rm -f /tmp/farameet-index.html'
+
+      - name: Verify deployed website
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          set -eu
+
+          curl --fail --show-error --silent \
+            --retry 3 \
+            --retry-delay 2 \
+            --retry-connrefused \
+            "http://${SERVER_HOST}/" \
+            -H "Host: server.farameet.ir" \
+            -o /tmp/deployed-page.html
+
+          grep -q '<html' /tmp/deployed-page.html
+
+          echo "Website deployment verified."
