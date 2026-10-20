@@ -1,3 +1,4 @@
+
 name: Deploy Laravel to staging
 
 on:
@@ -121,8 +122,7 @@ jobs:
           test -f "$RELEASE/composer.lock"
           test -f "$RELEASE/package-lock.json"
 
-          # Update tracked application files without replacing
-          # environment settings, persistent data or built assets.
+          # Update application files while preserving server data.
           rsync -a \
             --exclude='.env' \
             --exclude='vendor/' \
@@ -150,23 +150,20 @@ jobs:
           npm ci
           npm run build
 
-          # Clear cached Laravel configuration and application caches.
+          # Clear Laravel configuration and application caches.
           php8.4 artisan optimize:clear
 
-          # Restrict permission changes to Laravel's writable paths.
-          chown -R opsadmin:www-data \
-            "$APP/storage" "$APP/bootstrap/cache"
+          # Set writable permissions without changing ownership.
+          chmod -R g+rwX "$APP/storage" "$APP/bootstrap/cache"
 
           find "$APP/storage" "$APP/bootstrap/cache" \
-            -type d -exec chmod 2770 {} \;
+            -type d -exec chmod g+s {} \;
 
-          find "$APP/storage" "$APP/bootstrap/cache" \
-            -type f -exec chmod 0660 {} \;
-
+          # Preserve restrictive permissions on sensitive files.
           chmod 640 "$APP/.env"
           chmod 660 "$APP/database/database.sqlite"
 
-          # Report the deployed application configuration.
+          # Report deployed application configuration.
           php8.4 artisan about
 
           REMOTE
