@@ -1,5 +1,5 @@
 
-name: Deploy Laravel to staging
+name: Deploy Laravel Docker to staging
 
 on:
   push:
@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - "laravel-app/**"
+      - "compose.staging.yaml"
       - ".github/workflows/laravel-staging-deploy.yml"
   workflow_dispatch:
 
@@ -43,7 +44,6 @@ jobs:
             | base64 --decode > ~/.ssh/deploy_key
 
           chmod 600 ~/.ssh/deploy_key
-
           ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null
 
           ssh-keyscan -H "$SERVER_HOST" \
@@ -65,32 +65,38 @@ jobs:
             -o BatchMode=yes \
             "$SERVER_USER@$SERVER_HOST" 'whoami'
 
-      - name: Upload Laravel application
+      - name: Build Docker image
+        run: |
+          set -eu
+          docker build \
+            --pull \
+            -t farameet-laravel-staging:latest \
+            -f laravel-app/Dockerfile \
+            laravel-app
+
+          docker save farameet-laravel-staging:latest \
+            | gzip -1 > /tmp/farameet-laravel-staging.tar.gz
+
+      - name: Transfer image and Compose configuration
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
         run: |
           set -eu
 
-          tar \
-            --exclude='./.env' \
-            --exclude='./vendor' \
-            --exclude='./node_modules' \
-            --exclude='./storage' \
-            --exclude='./bootstrap/cache' \
-            --exclude='./database/*.sqlite' \
-            --exclude='./database/*.sqlite-*' \
-            --exclude='./public/build' \
-            -czf /tmp/laravel-app.tar.gz \
-            -C laravel-app .
+          scp -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            /tmp/farameet-laravel-staging.tar.gz \
+            "$SERVER_USER@$SERVER_HOST:/tmp/farameet-laravel-staging.tar.gz"
 
           scp -i ~/.ssh/deploy_key \
             -o IdentitiesOnly=yes \
             -o BatchMode=yes \
-            /tmp/laravel-app.tar.gz \
-            "$SERVER_USER@$SERVER_HOST:/tmp/laravel-app.tar.gz"
+            compose.staging.yaml \
+            "$SERVER_USER@$SERVER_HOST:/tmp/compose.staging.yaml"
 
-      - name: Install and build on staging
+      - name: Deploy container to staging
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
@@ -104,71 +110,44 @@ jobs:
           set -eu
 
           APP=/var/www/laravel-staging
-          RELEASE=/tmp/laravel-staging-release
 
-          # Protect the existing staging environment and database.
-          test -f "$APP/.env"
-          test -f "$APP/database/database.sqlite"
-          test -f /tmp/laravel-app.tar.gz
+          # Refuse to deploy if existing staging data is missing.
+          test -s "$APP/.env"
+          test -s "$APP/database/database.sqlite"
+          test -d "$APP/storage"
+          test -s /tmp/farameet-laravel-staging.tar.gz
+          test -s /tmp/compose.staging.yaml
 
-          # Extract and validate the uploaded release.
-          rm -rf "$RELEASE"
-          mkdir -p "$RELEASE"
+          # Verify that the server-side Compose file uses the
+          # expected staging paths and localhost-only port.
+          grep -Fq '/var/www/laravel-staging/.env' \
+            /tmp/compose.staging.yaml
+          grep -Fq '127.0.0.1:8081:8000' \
+            /tmp/compose.staging.yaml
 
-          tar -xzf /tmp/laravel-app.tar.gz -C "$RELEASE"
+          # Preserve the existing .env and database.
+          # Load the new image before replacing the container.
+          sudo docker load \
+            -i /tmp/farameet-laravel-staging.tar.gz
 
-          test -f "$RELEASE/artisan"
-          test -f "$RELEASE/composer.json"
-          test -f "$RELEASE/composer.lock"
-          test -f "$RELEASE/package-lock.json"
-
-          # Update application files while preserving server data.
-          rsync -a \
-            --exclude='.env' \
-            --exclude='vendor/' \
-            --exclude='node_modules/' \
-            --exclude='storage/' \
-            --exclude='bootstrap/cache/' \
-            --exclude='database/*.sqlite' \
-            --exclude='database/*.sqlite-*' \
-            --exclude='public/build/' \
-            "$RELEASE/" "$APP/"
-
-          rm -rf "$RELEASE"
-          rm -f /tmp/laravel-app.tar.gz
+          install -m 0644 /tmp/compose.staging.yaml \
+            "$APP/compose.staging.yaml"
 
           cd "$APP"
 
-          # Install locked PHP dependencies using PHP 8.4.
-          php8.4 "$(command -v composer)" install \
-            --no-dev \
-            --no-interaction \
-            --prefer-dist \
-            --optimize-autoloader
+          sudo docker compose \
+            -f "$APP/compose.staging.yaml" config --quiet
 
-          # Install locked JavaScript dependencies and build assets.
-          npm ci
-          npm run build
+          sudo docker compose \
+            -f "$APP/compose.staging.yaml" \
+            up -d --no-build --force-recreate
 
-          # Clear Laravel configuration and application caches.
-          php8.4 artisan optimize:clear
-
-          # Set writable permissions without changing ownership.
-          chmod -R g+rwX "$APP/storage" "$APP/bootstrap/cache"
-
-          find "$APP/storage" "$APP/bootstrap/cache" \
-            -type d -exec chmod g+s {} \;
-
-          # Preserve restrictive permissions on sensitive files.
-          chmod 640 "$APP/.env"
-          chmod 660 "$APP/database/database.sqlite"
-
-          # Report deployed application configuration.
-          php8.4 artisan about
+          rm -f /tmp/farameet-laravel-staging.tar.gz
+          rm -f /tmp/compose.staging.yaml
 
           REMOTE
 
-      - name: Verify staging application
+      - name: Verify staging HTTP response
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
@@ -178,7 +157,24 @@ jobs:
           ssh -i ~/.ssh/deploy_key \
             -o IdentitiesOnly=yes \
             -o BatchMode=yes \
-            "$SERVER_USER@$SERVER_HOST" \
-            "curl --fail --silent --show-error \
-            http://127.0.0.1:8081/ > /dev/null \
-            && echo 'Laravel staging returned HTTP success.'"
+            "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
+          set -eu
+
+          APP=/var/www/laravel-staging
+          URL=http://127.0.0.1:8081/
+
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent --show-error \
+              "$URL" -o /dev/null; then
+              echo "Laravel Docker staging returned HTTP success."
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "Staging health check failed."
+          sudo docker compose \
+            -f "$APP/compose.staging.yaml" logs --tail=100 laravel
+          exit 1
+          REMOTE
