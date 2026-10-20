@@ -68,6 +68,7 @@ jobs:
       - name: Build Docker image
         run: |
           set -eu
+
           docker build \
             --pull \
             -t farameet-laravel-staging:latest \
@@ -106,46 +107,8 @@ jobs:
           ssh -i ~/.ssh/deploy_key \
             -o IdentitiesOnly=yes \
             -o BatchMode=yes \
-            "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
-          set -eu
-
-          APP=/var/www/laravel-staging
-
-          # Refuse to deploy if existing staging data is missing.
-          test -s "$APP/.env"
-          test -s "$APP/database/database.sqlite"
-          test -d "$APP/storage"
-          test -s /tmp/farameet-laravel-staging.tar.gz
-          test -s /tmp/compose.staging.yaml
-
-          # Verify that the server-side Compose file uses the
-          # expected staging paths and localhost-only port.
-          grep -Fq '/var/www/laravel-staging/.env' \
-            /tmp/compose.staging.yaml
-          grep -Fq '127.0.0.1:8081:8000' \
-            /tmp/compose.staging.yaml
-
-          # Preserve the existing .env and database.
-          # Load the new image before replacing the container.
-          sudo docker load \
-            -i /tmp/farameet-laravel-staging.tar.gz
-
-          install -m 0644 /tmp/compose.staging.yaml \
-            "$APP/compose.staging.yaml"
-
-          cd "$APP"
-
-          sudo docker compose \
-            -f "$APP/compose.staging.yaml" config --quiet
-
-          sudo docker compose \
-            -f "$APP/compose.staging.yaml" \
-            up -d --no-build --force-recreate
-
-          rm -f /tmp/farameet-laravel-staging.tar.gz
-          rm -f /tmp/compose.staging.yaml
-
-          REMOTE
+            "$SERVER_USER@$SERVER_HOST" \
+            'sudo /usr/local/sbin/deploy-laravel-staging'
 
       - name: Verify staging HTTP response
         env:
@@ -160,7 +123,6 @@ jobs:
             "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
           set -eu
 
-          APP=/var/www/laravel-staging
           URL=http://127.0.0.1:8081/
 
           for attempt in $(seq 1 20); do
@@ -174,7 +136,5 @@ jobs:
           done
 
           echo "Staging health check failed."
-          sudo docker compose \
-            -f "$APP/compose.staging.yaml" logs --tail=100 laravel
           exit 1
           REMOTE
