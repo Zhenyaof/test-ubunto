@@ -1,0 +1,187 @@
+name: Deploy Laravel to staging
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "laravel-app/**"
+      - ".github/workflows/laravel-staging-deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: laravel-staging-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_SSH_KEY_B64: ${{ secrets.SERVER_SSH_KEY_B64 }}
+        run: |
+          set -eu
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          test -n "$SERVER_HOST"
+          test -n "$SERVER_SSH_KEY_B64"
+
+          printf '%s' "$SERVER_SSH_KEY_B64" \
+            | base64 --decode > ~/.ssh/deploy_key
+
+          chmod 600 ~/.ssh/deploy_key
+
+          ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null
+
+          ssh-keyscan -H "$SERVER_HOST" \
+            >> ~/.ssh/known_hosts 2>/dev/null
+
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Test SSH connection
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          set -eu
+
+          test -n "$SERVER_USER"
+
+          ssh -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            "$SERVER_USER@$SERVER_HOST" 'whoami'
+
+      - name: Upload Laravel application
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          set -eu
+
+          tar \
+            --exclude='./.env' \
+            --exclude='./vendor' \
+            --exclude='./node_modules' \
+            --exclude='./storage' \
+            --exclude='./bootstrap/cache' \
+            --exclude='./database/*.sqlite' \
+            --exclude='./database/*.sqlite-*' \
+            --exclude='./public/build' \
+            -czf /tmp/laravel-app.tar.gz \
+            -C laravel-app .
+
+          scp -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            /tmp/laravel-app.tar.gz \
+            "$SERVER_USER@$SERVER_HOST:/tmp/laravel-app.tar.gz"
+
+      - name: Install and build on staging
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          set -eu
+
+          ssh -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
+          set -eu
+
+          APP=/var/www/laravel-staging
+          RELEASE=/tmp/laravel-staging-release
+
+          # Protect the existing staging environment and database.
+          test -f "$APP/.env"
+          test -f "$APP/database/database.sqlite"
+          test -f /tmp/laravel-app.tar.gz
+
+          # Extract and validate the uploaded release.
+          rm -rf "$RELEASE"
+          mkdir -p "$RELEASE"
+
+          tar -xzf /tmp/laravel-app.tar.gz -C "$RELEASE"
+
+          test -f "$RELEASE/artisan"
+          test -f "$RELEASE/composer.json"
+          test -f "$RELEASE/composer.lock"
+          test -f "$RELEASE/package-lock.json"
+
+          # Update tracked application files without replacing
+          # environment settings, persistent data or built assets.
+          rsync -a \
+            --exclude='.env' \
+            --exclude='vendor/' \
+            --exclude='node_modules/' \
+            --exclude='storage/' \
+            --exclude='bootstrap/cache/' \
+            --exclude='database/*.sqlite' \
+            --exclude='database/*.sqlite-*' \
+            --exclude='public/build/' \
+            "$RELEASE/" "$APP/"
+
+          rm -rf "$RELEASE"
+          rm -f /tmp/laravel-app.tar.gz
+
+          cd "$APP"
+
+          # Install locked PHP dependencies using PHP 8.4.
+          php8.4 "$(command -v composer)" install \
+            --no-dev \
+            --no-interaction \
+            --prefer-dist \
+            --optimize-autoloader
+
+          # Install locked JavaScript dependencies and build assets.
+          npm ci
+          npm run build
+
+          # Clear cached Laravel configuration and application caches.
+          php8.4 artisan optimize:clear
+
+          # Restrict permission changes to Laravel's writable paths.
+          chown -R opsadmin:www-data \
+            "$APP/storage" "$APP/bootstrap/cache"
+
+          find "$APP/storage" "$APP/bootstrap/cache" \
+            -type d -exec chmod 2770 {} \;
+
+          find "$APP/storage" "$APP/bootstrap/cache" \
+            -type f -exec chmod 0660 {} \;
+
+          chmod 640 "$APP/.env"
+          chmod 660 "$APP/database/database.sqlite"
+
+          # Report the deployed application configuration.
+          php8.4 artisan about
+
+          REMOTE
+
+      - name: Verify staging application
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          set -eu
+
+          ssh -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            "$SERVER_USER@$SERVER_HOST" \
+            "curl --fail --silent --show-error \
+            http://127.0.0.1:8081/ > /dev/null \
+            && echo 'Laravel staging returned HTTP success.'"
